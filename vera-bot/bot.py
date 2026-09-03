@@ -30,6 +30,12 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # loads GEMINI_API_KEY / GROQ_API_KEY from a local .env file if present
+except ImportError:
+    pass  # dotenv optional — fine in production where env vars are set by the host (e.g. Render)
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("vera-bot")
 
@@ -40,8 +46,8 @@ log = logging.getLogger("vera-bot")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 TEAM_NAME = os.environ.get("TEAM_NAME", "Asad Solo")
 TEAM_MEMBERS = os.environ.get("TEAM_MEMBERS", "Shaik Asad Ahmed")
@@ -123,7 +129,14 @@ async def _call_groq(system_prompt: str, user_prompt: str) -> str:
     if not GROQ_API_KEY:
         raise LLMError("GROQ_API_KEY not set")
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        # Groq sits behind Cloudflare, which can reject requests carrying a
+        # generic/library default User-Agent as bot traffic (HTTP 403,
+        # Cloudflare error 1010). A normal browser-style UA avoids that.
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
     body = {
         "model": GROQ_MODEL,
         "temperature": 0,
