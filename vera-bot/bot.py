@@ -222,11 +222,20 @@ message. Decide the next move.
 Rules:
 1. Detect auto-replies: if the incoming message looks like a generic canned reply (e.g. "Thank \
 you for contacting us, our team will get back to you") even without an exact repeat yet, note it — \
-but the caller already handles the hard "3 verbatim repeats = end" case deterministically before \
-calling you, so you only need to use judgment for near-duplicate or clearly-templated single \
-occurrences (`auto_reply_streak` field tells you how many exact repeats have occurred so far).
+but the caller already handles the hard "3 near-identical repeats = end" case deterministically \
+before calling you, so you only need to use judgment for near-duplicate or clearly-templated single \
+occurrences. Two fields help you: `auto_reply_streak` (how many normalized-identical repeats have \
+occurred so far, including this one) and `canned_pattern_match` (true if this message's wording \
+matches common auto-responder boilerplate even on its first occurrence). If `canned_pattern_match` \
+is true, lean toward "wait" with a longer wait_seconds rather than "send" — don't keep messaging \
+into what looks like an unattended inbox.
 2. Detect explicit intent ("yes", "I want to join", "go ahead", "let's do it") and route straight \
-to action — do not re-ask qualifying questions.
+to action — do not re-ask qualifying questions. The input's `intent_detected` field is a \
+deterministic pre-check for this. If `intent_detected` is true, it is non-negotiable: your reply \
+must NOT contain a question mark, must NOT re-ask or re-confirm anything the merchant/customer just \
+agreed to, and must instead state the concrete next step in one decisive sentence (what happens \
+now, or the one piece of info you genuinely still need to execute — never "are you sure" or "would \
+you like to proceed").
 3. If the other party asks for time / says "later" / "not now", choose "wait" with a reasonable \
 wait_seconds (900-3600).
 4. If they say "not interested" / "stop" / clearly decline, choose "end" gracefully, no hard sell.
@@ -251,6 +260,59 @@ Return ONLY a JSON object with exactly these keys:
 }
 Omit keys that don't apply to the chosen action. No markdown fences, just the JSON object.
 """
+
+
+_WS_RE = re.compile(r"\s+")
+_TRAILING_PUNCT_RE = re.compile(r"[!.?,]+$")
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Normalize a message for auto-reply/duplicate comparison: case-fold,
+    collapse whitespace, drop trailing punctuation. Two canned replies that
+    differ only by a stray space, a trailing period, or casing should still
+    count as the 'same' message for streak purposes — exact byte-equality
+    was too strict and let real auto-replies slip through undetected."""
+    t = text.strip().lower()
+    t = _WS_RE.sub(" ", t)
+    t = _TRAILING_PUNCT_RE.sub("", t)
+    return t
+
+
+_CANNED_REPLY_PATTERNS = [
+    r"thank(?:s| you) for (?:contacting|reaching out)",
+    r"(?:our )?team will (?:get back|revert|respond)",
+    r"we(?:'| ha)ve received your (?:message|query|request)",
+    r"currently (?:unavailable|away|out of office)",
+    r"this is an automated (?:reply|response|message)",
+    r"will (?:get back to you|revert) (?:shortly|soon|within)",
+]
+_CANNED_REPLY_RE = re.compile("|".join(_CANNED_REPLY_PATTERNS), re.IGNORECASE)
+
+
+def _looks_canned(text: str) -> bool:
+    """Heuristic single-occurrence canned-reply detector (auto-responder
+    boilerplate) — fires on the FIRST occurrence, independent of the
+    repeat-streak check below, so the LLM gets a signal even before a
+    message has repeated at all."""
+    return bool(_CANNED_REPLY_RE.search(text))
+
+
+_INTENT_PATTERNS = [
+    r"\byes\b", r"\byeah\b", r"\byep\b", r"\bsure\b", r"\bok(?:ay)?\b",
+    r"\bgo ahead\b", r"\blet'?s do (?:it|this)\b", r"\bi'?m in\b",
+    r"\bcount me in\b", r"\bsign me up\b", r"\bi want to join\b",
+    r"\bi'?d like to\b", r"\bplease proceed\b", r"\bconfirm(?:ed)?\b",
+    r"\bagreed\b", r"\bdone deal\b", r"\bi want it\b", r"\blet'?s go\b",
+]
+_INTENT_RE = re.compile("|".join(_INTENT_PATTERNS), re.IGNORECASE)
+
+
+def _detect_explicit_intent(text: str) -> bool:
+    """Deterministic pre-check for an explicit affirmative/action signal
+    ('yes', 'go ahead', 'sign me up', ...). Used to force the composer to
+    route straight to the next action step instead of re-asking a
+    qualifying question it already has the answer to."""
+    return bool(_INTENT_RE.search(text.strip()))
 
 
 def _digest_for(category: dict, digest_id: Optional[str]) -> Optional[dict]:
@@ -373,30 +435,45 @@ def _fallback_compose(merchant: dict, trigger: dict) -> dict:
 
 
 async def compose_reply(conv: dict, from_role: str, message: str) -> dict:
-    # Auto-reply detection: count consecutive verbatim-identical incoming
-    # messages from the same party (this call's message plus prior ones).
-    prior_incoming = [t["body"] for t in conv["turns"] if t["from"] == from_role]
-    auto_streak = 0
+    # Auto-reply detection: count consecutive near-identical incoming
+    # messages from the same party, on NORMALIZED text (case/whitespace/
+    # trailing-punctuation insensitive) so a canned reply that differs only
+    # by formatting still counts toward the streak. The caller already
+    # appended this call's message to conv["turns"] before invoking us, so
+    # we exclude it from the scan and count it separately as the base of 1
+    # — the previous version counted it twice inside the same list, which
+    # made the deterministic cutoff fire one occurrence too early (2nd
+    # repeat instead of the intended 3rd).
+    norm_message = _normalize_for_dedup(message)
+    prior_incoming = [t["body"] for t in conv["turns"][:-1] if t["from"] == from_role]
+    auto_streak = 1  # this message itself
     for b in reversed(prior_incoming):
-        if b == message:
+        if _normalize_for_dedup(b) == norm_message:
             auto_streak += 1
         else:
             break
 
     # Deterministic short-circuit — don't rely on the LLM to notice a pattern
-    # under time pressure. "Same text 3+ times" (per brief hint) = canned
-    # auto-reply -> exit immediately, no further LLM call needed.
-    if auto_streak >= AUTO_REPLY_END_THRESHOLD:
+    # under time pressure. AUTO_REPLY_END_THRESHOLD prior near-identical
+    # repeats + this one (i.e. the 3rd occurrence, per the brief's hint) =
+    # canned auto-reply -> exit immediately, no further LLM call needed.
+    if auto_streak > AUTO_REPLY_END_THRESHOLD:
         return {
             "action": "end",
-            "rationale": f"Detected {auto_streak + 1} verbatim-identical replies — treating as a "
-                         f"canned auto-reply, exiting to avoid spamming a non-human responder.",
+            "rationale": f"Detected {auto_streak} near-identical replies in a row (normalized) — "
+                         f"treating as a canned auto-reply, exiting to avoid spamming a non-human "
+                         f"responder.",
         }
+
+    canned_pattern_match = _looks_canned(message)
+    intent_detected = _detect_explicit_intent(message)
 
     payload = {
         "from_role": from_role,
         "latest_message": message,
         "auto_reply_streak": auto_streak,
+        "canned_pattern_match": canned_pattern_match,
+        "intent_detected": intent_detected,
         "conversation_so_far": conv["turns"][-10:],
         "previous_bodies_sent_by_bot": list(conv.get("sent_bodies", [])),
     }
@@ -405,6 +482,23 @@ async def compose_reply(conv: dict, from_role: str, message: str) -> dict:
     )
     try:
         result = await call_llm(REPLY_SYSTEM_PROMPT, user_prompt)
+        # Safety net: intent_detected is supposed to be non-negotiable, but an
+        # LLM under instruction pressure can still slip a qualifying question
+        # back in. Catch it deterministically and force one corrective retry
+        # (same pattern as the anti-hallucination retry in compose()).
+        if (
+            intent_detected
+            and result.get("action") == "send"
+            and str(result.get("body", "")).strip().endswith("?")
+        ):
+            log.warning("compose_reply(): intent_detected but reply still asked a question, retrying once")
+            retry_prompt = user_prompt + (
+                "\n\nNOTE: intent_detected is true and your previous reply still ended in a "
+                "question mark. That is not allowed here. Rewrite the reply to move straight to "
+                "the next concrete action step — no question marks, no re-confirming what they "
+                "already agreed to."
+            )
+            result = await call_llm(REPLY_SYSTEM_PROMPT, retry_prompt)
     except LLMError as e:
         log.error("compose_reply() LLM failure, using safe fallback: %s", e)
         result = {"action": "wait", "wait_seconds": 1800, "rationale": "LLM unavailable; backing off."}
