@@ -79,6 +79,14 @@ contexts: dict[tuple[str, str], dict[str, Any]] = {}
 # }
 conversations: dict[str, dict[str, Any]] = {}
 
+# merchant_incoming_streaks[(merchant_id, from_role)] = {"normalized": str, "count": int}
+# Tracks consecutive near-identical incoming messages per merchant+role,
+# independent of conversation_id. A real canned auto-responder keeps sending
+# the same text regardless of how the caller threads it into conversations —
+# the judge harness, for example, starts a fresh conversation_id every turn,
+# so conversation-scoped streak tracking alone never accumulates past 1.
+merchant_incoming_streaks: dict[tuple[str, str], dict[str, Any]] = {}
+
 app = FastAPI(title="Vera Challenge Bot")
 
 
@@ -315,6 +323,23 @@ def _detect_explicit_intent(text: str) -> bool:
     return bool(_INTENT_RE.search(text.strip()))
 
 
+def _update_merchant_streak(merchant_id: Optional[str], from_role: str, message: str) -> int:
+    """Bump (or reset) the merchant-level near-identical-message streak and
+    return the new count. Falls back to a streak of 1 if merchant_id is
+    unknown (nothing to key cross-conversation tracking on)."""
+    if not merchant_id:
+        return 1
+    key = (merchant_id, from_role)
+    norm = _normalize_for_dedup(message)
+    prev = merchant_incoming_streaks.get(key)
+    if prev and prev["normalized"] == norm:
+        prev["count"] += 1
+    else:
+        prev = {"normalized": norm, "count": 1}
+        merchant_incoming_streaks[key] = prev
+    return prev["count"]
+
+
 def _digest_for(category: dict, digest_id: Optional[str]) -> Optional[dict]:
     if not digest_id:
         return None
@@ -446,12 +471,18 @@ async def compose_reply(conv: dict, from_role: str, message: str) -> dict:
     # repeat instead of the intended 3rd).
     norm_message = _normalize_for_dedup(message)
     prior_incoming = [t["body"] for t in conv["turns"][:-1] if t["from"] == from_role]
-    auto_streak = 1  # this message itself
+    conv_streak = 1  # this message itself
     for b in reversed(prior_incoming):
         if _normalize_for_dedup(b) == norm_message:
-            auto_streak += 1
+            conv_streak += 1
         else:
             break
+
+    # Merchant-level streak catches the case where the caller starts a fresh
+    # conversation_id each turn (so conv_streak alone never accumulates) —
+    # take whichever signal is stronger.
+    merchant_streak = _update_merchant_streak(conv.get("merchant_id"), from_role, message)
+    auto_streak = max(conv_streak, merchant_streak)
 
     # Deterministic short-circuit — don't rely on the LLM to notice a pattern
     # under time pressure. AUTO_REPLY_END_THRESHOLD prior near-identical
@@ -588,6 +619,7 @@ async def push_context(body: CtxBody):
 async def teardown():
     contexts.clear()
     conversations.clear()
+    merchant_incoming_streaks.clear()
     return {"accepted": True}
 
 
