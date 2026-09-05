@@ -243,7 +243,9 @@ deterministic pre-check for this. If `intent_detected` is true, it is non-negoti
 must NOT contain a question mark, must NOT re-ask or re-confirm anything the merchant/customer just \
 agreed to, and must instead state the concrete next step in one decisive sentence (what happens \
 now, or the one piece of info you genuinely still need to execute — never "are you sure" or "would \
-you like to proceed").
+you like to proceed"). Frame it as a forward-moving next step (e.g. "Here's the next step — ..." or \
+"To confirm this, ...") rather than a plain open-ended ask, so the shift to action mode is \
+unambiguous.
 3. If the other party asks for time / says "later" / "not now", choose "wait" with a reasonable \
 wait_seconds (900-3600).
 4. If they say "not interested" / "stop" / clearly decline, choose "end" gracefully, no hard sell.
