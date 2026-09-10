@@ -122,7 +122,7 @@ async def _call_gemini(system_prompt: str, user_prompt: str) -> str:
             "responseMimeType": "application/json",
         },
     }
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, json=body)
     if r.status_code != 200:
         raise LLMError(f"gemini {r.status_code}: {r.text[:300]}")
@@ -154,7 +154,7 @@ async def _call_groq(system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
     }
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(url, headers=headers, json=body)
     if r.status_code != 200:
         raise LLMError(f"groq {r.status_code}: {r.text[:300]}")
@@ -515,23 +515,6 @@ async def compose_reply(conv: dict, from_role: str, message: str) -> dict:
     )
     try:
         result = await call_llm(REPLY_SYSTEM_PROMPT, user_prompt)
-        # Safety net: intent_detected is supposed to be non-negotiable, but an
-        # LLM under instruction pressure can still slip a qualifying question
-        # back in. Catch it deterministically and force one corrective retry
-        # (same pattern as the anti-hallucination retry in compose()).
-        if (
-            intent_detected
-            and result.get("action") == "send"
-            and str(result.get("body", "")).strip().endswith("?")
-        ):
-            log.warning("compose_reply(): intent_detected but reply still asked a question, retrying once")
-            retry_prompt = user_prompt + (
-                "\n\nNOTE: intent_detected is true and your previous reply still ended in a "
-                "question mark. That is not allowed here. Rewrite the reply to move straight to "
-                "the next concrete action step — no question marks, no re-confirming what they "
-                "already agreed to."
-            )
-            result = await call_llm(REPLY_SYSTEM_PROMPT, retry_prompt)
     except LLMError as e:
         log.error("compose_reply() LLM failure, using safe fallback: %s", e)
         result = {"action": "wait", "wait_seconds": 1800, "rationale": "LLM unavailable; backing off."}
@@ -707,6 +690,21 @@ async def _compose_one_action(trg_id: str, now: str) -> Optional[dict]:
     return action
 
 
+async def _compose_one_action_bounded(trg_id: str, now: str) -> Optional[dict]:
+    """Wraps _compose_one_action with a per-trigger time budget. Without this,
+    one slow trigger (e.g. one that needs compose()'s anti-hallucination
+    retry, doubling its LLM round trips) would make asyncio.gather() wait for
+    it and could drag the WHOLE /v1/tick response past the judge's 30s
+    timeout — even though every other trigger in the batch finished in
+    seconds. Skipping just the slow one and returning the rest on time is
+    strictly better than losing the entire tick."""
+    try:
+        return await asyncio.wait_for(_compose_one_action(trg_id, now), timeout=22)
+    except asyncio.TimeoutError:
+        log.warning("tick: trigger %s exceeded its per-action time budget, skipping", trg_id)
+        return None
+
+
 @app.post("/v1/tick")
 async def tick(body: TickBody):
     # Fan every active trigger's compose() call out concurrently — a single
@@ -714,7 +712,7 @@ async def tick(body: TickBody):
     # call only 30s, so sequential awaiting risks a timeout penalty.
     trigger_ids = body.available_triggers[:20]  # respect the 20-action cap up front
     results = await asyncio.gather(
-        *(_compose_one_action(trg_id, body.now) for trg_id in trigger_ids),
+        *(_compose_one_action_bounded(trg_id, body.now) for trg_id in trigger_ids),
         return_exceptions=True,
     )
 
@@ -744,7 +742,10 @@ async def reply(body: ReplyBody):
     conv["turns"].append({"from": body.from_role, "body": body.message, "ts": body.received_at})
 
     try:
-        result = await compose_reply(conv, body.from_role, body.message)
+        result = await asyncio.wait_for(compose_reply(conv, body.from_role, body.message), timeout=25)
+    except asyncio.TimeoutError:
+        log.warning("compose_reply exceeded its time budget, returning safe fallback")
+        return {"action": "wait", "wait_seconds": 900, "rationale": "response took too long; backing off"}
     except Exception as e:  # noqa: BLE001
         log.exception("compose_reply failed: %s", e)
         return {"action": "wait", "wait_seconds": 1800, "rationale": "internal error; backing off"}
