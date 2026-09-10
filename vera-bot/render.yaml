@@ -11,9 +11,9 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-2.0-flash
+        value: gemini-flash-latest
       - key: GROQ_MODEL
-        value: llama-3.3-70b-versatile
+        value: openai/gpt-oss-120b
       - key: TEAM_NAME
         value: "Asad Solo"
       - key: TEAM_MEMBERS
