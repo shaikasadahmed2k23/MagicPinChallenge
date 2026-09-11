@@ -2,6 +2,56 @@
 
 FastAPI service implementing the magicpin AI Challenge 5-endpoint judge contract.
 
+## Approach, tradeoffs, and what would have helped most
+
+**Approach.** `compose()` builds one JSON prompt from the four context layers
+(category voice/taboos, merchant identity/performance/offers/history, trigger
+kind/payload/urgency, optional customer) and asks the LLM for a grounded,
+category-voiced, single-CTA message at `temperature=0`. A deterministic
+post-check (`_grounded_in_context`) verifies every number in the output
+literally appears in the source context, with one corrective retry before
+falling back to a minimal rule-based template — the bot should never invent a
+stat, and never go silent even if both LLM providers are down.
+`compose_reply()` (`/v1/reply`) layers three deterministic signals *before*
+the LLM decides: an auto-reply streak counter (merchant-level, not just
+conversation-level, since a real auto-responder doesn't care how we thread
+conversations), a canned-boilerplate regex match, and an explicit-intent
+regex match — so the bot doesn't rely on the LLM to notice an obvious pattern
+under time pressure, and can short-circuit to `end` without even calling an
+LLM once an auto-reply is confirmed.
+
+**Tradeoffs.**
+- *Reliability over single-provider "best" quality*: Gemini and Groq are
+  raced concurrently per call (not sequential fallback) because Gemini's
+  free-tier capacity has been visibly inconsistent (slow 503s under "high
+  demand") during development — a race bounds worst-case latency to whichever
+  provider actually responds, comfortably inside the judge's 30s budget,
+  at the cost of always spending a Groq call even when Gemini would've been
+  fine.
+- *Determinism over LLM flexibility* for auto-reply/intent detection: regex
+  pre-checks are less nuanced than pure LLM judgment on edge cases, but they
+  are fast, free, and can't be talked out of the pattern the way a prompted
+  instruction sometimes can under adversarial or repetitive input.
+- *Grounding retry over always-first-answer*: the anti-hallucination retry
+  roughly doubles that one call's latency when it fires, but a hallucinated
+  number is a worse failure than a slower reply, per the challenge's own
+  stated priorities — bounded by a per-trigger budget in `/v1/tick` so one
+  retry can't sink an entire batch.
+- *Rule-based fallback over erroring out*: if both LLM providers are
+  unavailable, the bot still returns a safe, generic (ungrounded-but-honest)
+  message rather than a 5xx — worse content quality, but never a broken
+  endpoint.
+
+**What additional context would have helped most.** Real reply/engagement
+data per compulsion lever (curiosity vs. loss-aversion vs. social-proof) by
+category, so message strategy could be tuned from evidence instead of the
+static example set; more worked examples for the thinner categories
+(pharmacies, salons) to calibrate voice as confidently as for
+dentists/restaurants; and earlier visibility into exactly what the
+post-submission context injection looks like (digest/performance/trigger
+shape), to validate the grounding logic against it before submission rather
+than only against the 30 canonical pairs.
+
 ## Endpoints
 - `POST /v1/context` — receive category/merchant/customer/trigger context pushes (idempotent by version)
 - `POST /v1/tick` — decide proactive actions for the given `available_triggers`
@@ -9,6 +59,19 @@ FastAPI service implementing the magicpin AI Challenge 5-endpoint judge contract
 - `GET  /v1/healthz` — liveness check
 - `GET  /v1/metadata` — team + model info
 - `POST /v1/teardown` — clears all in-memory state (used between judge test runs)
+
+## Generating submission.jsonl
+
+The 30 canonical test pairs live in `../expanded/test_pairs.json`. From the
+repo root:
+
+```bash
+python generate_submission.py
+```
+
+This resolves each pair's category/merchant/trigger/customer context from
+`expanded/`, calls `compose()` directly (no HTTP hop), and writes
+`vera-bot/submission.jsonl` — one JSON line per pair, in `T01..T30` order.
 
 ## Local run
 
