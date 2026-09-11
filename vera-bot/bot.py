@@ -60,7 +60,15 @@ START_TS = time.time()
 # whole /v1/tick call a 30s budget, so we fan compose() calls out concurrently
 # instead of awaiting them one at a time. Cap concurrency so we don't blow
 # through free-tier LLM rate limits.
-LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "6"))
+LLM_CONCURRENCY = int(os.environ.get("LLM_CONCURRENCY", "3"))
+# Each call_llm() invocation races BOTH Gemini and Groq (see call_llm() docstring),
+# so this caps simultaneous *provider* calls at 2x this number. Free-tier Groq's
+# TPM budget has been observed at ~8000 tokens/min against ~2700-3800 tokens per
+# compose() call — a tick fanning out 20 triggers at once (the testing brief's
+# per-tick action cap) at high concurrency reliably blew through that budget in
+# testing and fell back to the generic template for most of the batch. 3 keeps
+# worst-case concurrent provider calls at 6, closer to what free-tier TPM can
+# actually sustain; raise it (env var) once on a paid tier.
 _llm_semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
 
 AUTO_REPLY_END_THRESHOLD = 2  # 3rd verbatim-identical incoming message => end

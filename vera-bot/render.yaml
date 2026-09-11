@@ -14,6 +14,8 @@ services:
         value: gemini-flash-latest
       - key: GROQ_MODEL
         value: openai/gpt-oss-120b
+      - key: LLM_CONCURRENCY
+        value: "3"
       - key: TEAM_NAME
         value: "Asad Solo"
       - key: TEAM_MEMBERS
