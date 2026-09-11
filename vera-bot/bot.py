@@ -166,21 +166,42 @@ async def _call_groq(system_prompt: str, user_prompt: str) -> str:
 
 
 async def call_llm(system_prompt: str, user_prompt: str) -> dict:
-    """Try Gemini first, fall back to Groq. Returns parsed JSON dict.
+    """Race Gemini and Groq concurrently, return whichever succeeds first.
+    Sequential try-then-fallback meant a degraded provider (e.g. Gemini
+    returning 503 only after several seconds under 'high demand', observed
+    repeatedly in testing) ate most of the per-call time budget before Groq
+    was even attempted — worst case latency was the SUM of both providers'
+    timeouts. Racing bounds it to whichever ONE provider actually responds,
+    which is what the judge's 30s (and the local harness's stricter 15s)
+    per-call budget actually requires.
     Bounded by a semaphore so a burst of concurrent tick triggers can't blow
-    past free-tier LLM rate limits or the judge's 30s call budget."""
+    past free-tier LLM rate limits."""
     async with _llm_semaphore:
-        last_err = None
-        for fn, name in ((_call_gemini, "gemini"), (_call_groq, "groq")):
-            try:
-                raw = await fn(system_prompt, user_prompt)
-                cleaned = re.sub(r"^```json\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
-                return json.loads(cleaned)
-            except Exception as e:  # noqa: BLE001
-                log.warning("LLM provider %s failed: %s", name, e)
-                last_err = e
-                continue
-        raise LLMError(f"all providers failed: {last_err}")
+        tasks = {
+            asyncio.create_task(_call_gemini(system_prompt, user_prompt)): "gemini",
+            asyncio.create_task(_call_groq(system_prompt, user_prompt)): "groq",
+        }
+        pending = set(tasks)
+        errors = {}
+        raw = None
+        winner = None
+        while pending and winner is None:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                name = tasks[t]
+                try:
+                    raw = t.result()
+                    winner = name
+                    break
+                except Exception as e:  # noqa: BLE001
+                    log.warning("LLM provider %s failed: %s", name, e)
+                    errors[name] = e
+        for t in pending:
+            t.cancel()
+        if winner is None:
+            raise LLMError(f"all providers failed: {errors}")
+        cleaned = re.sub(r"^```json\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)
+        return json.loads(cleaned)
 
 
 # --------------------------------------------------------------------------
