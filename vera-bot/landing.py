@@ -136,8 +136,8 @@ LANDING_HTML = """<!doctype html>
     background: var(--ink);
     color: var(--paper);
     padding: 16px 18px;
-    white-space: pre;
-    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .ticket .dot {
