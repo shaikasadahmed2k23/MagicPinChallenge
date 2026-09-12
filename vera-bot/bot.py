@@ -28,6 +28,9 @@ from typing import Any, Literal, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+
+from landing import LANDING_HTML
 from pydantic import BaseModel, Field
 
 try:
@@ -804,6 +807,6 @@ async def reply(body: ReplyBody):
     }
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    return {"service": "vera-challenge-bot", "status": "ok", "docs": "/docs"}
+    return LANDING_HTML
